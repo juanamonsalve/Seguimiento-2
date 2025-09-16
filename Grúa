@@ -1,0 +1,192 @@
+from machine import Pin, PWM, ADC
+import time
+
+# ==========================
+# Configuración de pines
+# ==========================
+# Servos
+servoBase = PWM(Pin(13), freq=50)
+servoBrazo = PWM(Pin(12), freq=50)
+
+# Potenciómetros
+potBase = ADC(Pin(34))
+potBrazo = ADC(Pin(35))
+potBase.atten(ADC.ATTN_11DB)
+potBrazo.atten(ADC.ATTN_11DB)
+potBase.width(ADC.WIDTH_12BIT)
+potBrazo.width(ADC.WIDTH_12BIT)
+
+# LEDs y buzzer
+ledVerde = Pin(2, Pin.OUT)   # Modo manual
+ledRojo = Pin(4, Pin.OUT)    # Modo automático
+buzzer = Pin(5, Pin.OUT)
+
+# Botones
+btnReset = Pin(15, Pin.IN, Pin.PULL_UP)     # Retorno
+btnSecuencia = Pin(16, Pin.IN, Pin.PULL_UP) # Secuencia
+
+# Variables globales
+modoManual = True
+modoRetorno = False
+modoSecuencia = False
+esperando_recentralizado = False
+
+posBase = 90  # Posición inicial al encender
+posBrazo = 90 # Posición inicial del brazo en 90°
+
+# Para interrupciones con antirrebote
+evento = None
+ultimo_tiempo = 0
+DEBOUNCE = 200
+
+# Funciones auxiliares
+def moverServo(servo, angulo):
+    duty = int((angulo/180*2000 + 500) * 65535 / 20000)
+    servo.duty_u16(duty)
+
+def leerPotenciometros():
+    angBase = int((potBase.read() / 4095) * 180)
+    # Mapeo de 0-100% del potenciómetro a 90-180° del servo
+    angBrazo = int((potBrazo.read() / 4095) * 90) + 90
+    return angBase, angBrazo
+
+def activarAlarma():
+    ledRojo.on()
+    buzzer.on()
+
+def desactivarAlarma():
+    ledRojo.off()
+    buzzer.off()
+
+# Rutinas automáticas
+def rutinaRetorno():
+    global posBase, posBrazo, modoManual, modoRetorno, esperando_recentralizado
+    print("Ejecutando retorno...")
+    activarAlarma()
+    
+    # Retorno de la base a 0°
+    for i in range(posBase, 0, -2 if posBase > 0 else 2):
+        moverServo(servoBase, i)
+        time.sleep(0.02)
+    posBase = 0
+
+    # Retorno del brazo a su posición inicial (90°)
+    for j in range(posBrazo, 90, -2 if posBrazo > 90 else 2):
+        moverServo(servoBrazo, j)
+        time.sleep(0.02)
+    posBrazo = 90
+
+    desactivarAlarma()
+    modoRetorno = False
+    esperando_recentralizado = True
+    print("Retorno completo. Mueva los potenciómetros a la posición actual para reactivar.")
+
+def rutinaSecuencia():
+    global posBase, posBrazo, modoManual, modoSecuencia, esperando_recentralizado
+    print("Ejecutando secuencia...")
+    
+    posBaseGuardada = posBase
+    posBrazoGuardado = posBrazo
+    
+    activarAlarma()
+
+    # --- Secuencia de movimientos ---
+    for i in range(posBase, 30, -2): moverServo(servoBase, i); time.sleep(0.02)
+    posBase = 30
+    for j in range(posBrazo, 180, 2): moverServo(servoBrazo, j); time.sleep(0.02)
+    posBrazo = 180
+    for i in range(posBase, 150, 2): moverServo(servoBase, i); time.sleep(0.02)
+    posBase = 150
+    for j in range(posBrazo, 100, -2): moverServo(servoBrazo, j); time.sleep(0.02)
+    posBrazo = 100
+
+    # --- Regreso a posición guardada ---
+    print("Secuencia finalizada. Regresando a la posición anterior...")
+    for i in range(posBase, posBaseGuardada, -2 if posBase > posBaseGuardada else 2): moverServo(servoBase, i); time.sleep(0.02)
+    posBase = posBaseGuardada
+    for j in range(posBrazo, posBrazoGuardado, -2 if posBrazo > posBrazoGuardado else 2): moverServo(servoBrazo, j); time.sleep(0.02)
+    posBrazo = posBrazoGuardado
+
+    desactivarAlarma()
+    modoSecuencia = False
+    esperando_recentralizado = True
+    print("Secuencia completa. Mueva los potenciómetros a la posición actual para reactivar.")
+
+# ==========================
+# Interrupciones (eventos)
+# ==========================
+def interrupcionReset(pin):
+    global evento, ultimo_tiempo
+    ahora = time.ticks_ms()
+    if time.ticks_diff(ahora, ultimo_tiempo) > DEBOUNCE:
+        evento = "reset"
+        ultimo_tiempo = ahora
+
+def interrupcionSecuencia(pin):
+    global evento, ultimo_tiempo
+    ahora = time.ticks_ms()
+    if time.ticks_diff(ahora, ultimo_tiempo) > DEBOUNCE:
+        evento = "secuencia"
+        ultimo_tiempo = ahora
+
+btnReset.irq(trigger=Pin.IRQ_FALLING, handler=interrupcionReset)
+btnSecuencia.irq(trigger=Pin.IRQ_FALLING, handler=interrupcionSecuencia)
+
+# Posicionar servos al inicio
+moverServo(servoBase, posBase)
+moverServo(servoBrazo, posBrazo)
+print("Sistema iniciado")
+
+while True:
+    if evento == "reset":
+        modoManual = False
+        modoSecuencia = False
+        esperando_recentralizado = False
+        modoRetorno = True
+        ledVerde.off()
+        evento = None
+
+    elif evento == "secuencia":
+        modoManual = False
+        modoRetorno = False
+        esperando_recentralizado = False
+        modoSecuencia = True
+        ledVerde.off()
+        evento = None
+
+    # Lógica de estados
+    if modoManual:
+        ledVerde.on()
+        angBase, angBrazo = leerPotenciometros()
+        
+        # Zona muerta para evitar jitter
+        if abs(angBase - posBase) > 1:
+            moverServo(servoBase, angBase)
+            posBase = angBase
+            
+        if abs(angBrazo - posBrazo) > 1:
+            moverServo(servoBrazo, angBrazo)
+            posBrazo = angBrazo
+                    
+    elif modoRetorno:
+        rutinaRetorno()
+
+    elif modoSecuencia:
+        rutinaSecuencia()
+        
+    elif esperando_recentralizado:
+        ledVerde.on()
+        angBase, angBrazo = leerPotenciometros()
+        
+        # Sincronizar con la posición actual del servo
+        if abs(angBase - posBase) < 10 and abs(angBrazo - posBrazo) < 10:
+            print("Potenciómetros sincronizados. Control manual reactivado.")
+            esperando_recentralizado = False
+            modoManual = True
+
+    elif not modoManual and not modoRetorno and not modoSecuencia and not esperando_recentralizado:
+        ledVerde.off()
+        ledRojo.off()
+        buzzer.off()
+
+    time.sleep(0.05)
